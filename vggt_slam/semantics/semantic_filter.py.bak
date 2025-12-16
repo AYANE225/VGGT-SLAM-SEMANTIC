@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import cv2
+
+try:
+    import torch
+except Exception:
+    torch = None
+
+
+def _parse_ids(s: str | None) -> list[int]:
+    if s is None:
+        return []
+    s = str(s).strip()
+    if s == "":
+        return []
+    parts = s.replace(",", " ").split()
+    out: list[int] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
+
+def _find_conf_key(pred: dict) -> str | None:
+    # 常见命名先尝试
+    for k in ("confidence", "conf", "confs", "confidence_map", "weights", "weight", "w"):
+        if k in pred:
+            return k
+    return None
+
+
+def _is_torch(x) -> bool:
+    return torch is not None and "torch" in str(type(x))
+
+
+def _shape(x):
+    try:
+        return tuple(x.shape)
+    except Exception:
+        return None
+
+
+def _dtype_str(x):
+    try:
+        return str(x.dtype)
+    except Exception:
+        return str(type(x))
+
+
+def _infer_hw(conf):
+    shp = _shape(conf)
+    if shp is None or len(shp) < 2:
+        return None
+    return shp[-2], shp[-1]
+
+
+def apply_semantic_filter(predictions: dict, image_paths: list[str], args):
+    """
+    Read per-frame semantic masks and suppress pixels by setting confidence/weights to 0.
+
+    Args:
+        predictions: dict returned by solver.run_predictions(...)
+        image_paths: list of image paths used in this batch
+        args: argparse args, needs:
+            --semantic_dir, --semantic_suffix
+            --semantic_ignore_ids / --semantic_keep_ids
+            --semantic_missing_ok
+            --semantic_debug_dir / --semantic_debug_stride
+            --semantic_conf_key (optional)
+    """
+    sem_dir = getattr(args, "semantic_dir", "")
+    if not sem_dir:
+        return predictions
+
+    sem_dir = Path(sem_dir)
+    suffix = getattr(args, "semantic_suffix", ".png")
+    ignore_ids = set(_parse_ids(getattr(args, "semantic_ignore_ids", "")))
+    keep_ids = set(_parse_ids(getattr(args, "semantic_keep_ids", "")))
+    missing_ok = bool(getattr(args, "semantic_missing_ok", False))
+
+    debug_dir = getattr(args, "semantic_debug_dir", "")
+    debug_stride = int(getattr(args, "semantic_debug_stride", 20))
+    if debug_dir:
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        debug_dir = None
+
+    forced_key = str(getattr(args, "semantic_conf_key", "")).strip()
+    conf_key = forced_key if (forced_key and forced_key in predictions) else _find_conf_key(predictions)
+
+    if conf_key is None:
+        # 给出候选：float 且至少2维
+        cands = []
+        for k, v in predictions.items():
+            shp = _shape(v)
+            if shp is None or len(shp) < 2:
+                continue
+            dt = _dtype_str(v)
+            if "float" in dt or _is_torch(v):
+                cands.append((k, shp, dt))
+        print("[semantic] WARNING: cannot find confidence key in predictions, skip semantic filtering.")
+        if cands:
+            print("[semantic] NOTE: candidate float keys (maybe conf/weight):")
+            for k, shp, dt in cands:
+                print(f"  * {k}: shape={shp}, dtype={dt}")
+        return predictions
+
+    conf = predictions[conf_key]
+    hw = _infer_hw(conf)
+    if hw is None:
+        print(f"[semantic] WARNING: key '{conf_key}' has no H/W dims, skip semantic filtering.")
+        return predictions
+
+    H, W = hw
+    is_t = _is_torch(conf)
+    conf_out = conf.clone() if is_t else np.asarray(conf).copy()
+
+    keep_ratios = []
+    applied = 0
+
+    for i, img_path in enumerate(image_paths):
+        stem = Path(img_path).stem
+        mpath = sem_dir / f"{stem}{suffix}"
+
+        if not mpath.exists():
+            if missing_ok:
+                continue
+            raise FileNotFoundError(f"[semantic] mask not found: {mpath}")
+
+        m = cv2.imread(str(mpath), cv2.IMREAD_UNCHANGED)
+        if m is None:
+            if missing_ok:
+                continue
+            raise RuntimeError(f"[semantic] failed to read mask: {mpath}")
+
+        if m.ndim == 3:
+            m = m[..., 0]
+        m = m.astype(np.int64)
+
+        if m.shape != (H, W):
+            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        # keep=True 表示保留（静态/可用）
+        if len(keep_ids) > 0:
+            keep = np.isin(m, list(keep_ids))
+        else:
+            keep = ~np.isin(m, list(ignore_ids))
+
+        kr = float(keep.mean())
+        keep_ratios.append(kr)
+
+        if debug_dir is not None and (debug_stride <= 1 or (i % debug_stride) == 0):
+            cv2.imwrite(str(debug_dir / f"{stem}_keep.png"), (keep.astype(np.uint8) * 255))
+            cv2.imwrite(str(debug_dir / f"{stem}_label.png"), m.astype(np.uint16))
+
+        if is_t:
+            kt = torch.from_numpy(keep).to(device=conf_out.device)
+            # 常见形状：(B,1,H,W) 或 (B,H,W)
+            if conf_out.ndim == 4:
+                conf_out[i, 0] = conf_out[i, 0] * kt
+            elif conf_out.ndim == 3:
+                conf_out[i] = conf_out[i] * kt
+            elif conf_out.ndim == 2:
+                conf_out = conf_out * kt
+            else:
+                conf_out[i, ...] = conf_out[i, ...] * kt
+        else:
+            if conf_out.ndim == 4:
+                conf_out[i, 0] *= keep
+            elif conf_out.ndim == 3:
+                conf_out[i] *= keep
+            elif conf_out.ndim == 2:
+                conf_out *= keep
+            else:
+                conf_out[i, ...] *= keep
+
+        applied += 1
+
+    predictions[conf_key] = conf_out
+    predictions["_semantic_applied_frames"] = applied
+
+    if keep_ratios:
+        predictions["_semantic_keep_ratio_mean"] = float(np.mean(keep_ratios))
+        predictions["_semantic_keep_ratio_min"] = float(np.min(keep_ratios))
+        print(f"[semantic] key={conf_key} applied={applied} keep_mean={predictions['_semantic_keep_ratio_mean']:.3f} keep_min={predictions['_semantic_keep_ratio_min']:.3f}")
+
+    return predictions
