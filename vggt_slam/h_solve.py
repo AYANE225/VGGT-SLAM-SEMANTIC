@@ -162,3 +162,97 @@ def ransac_projective(X1_np, X2_np, threshold=0.01, max_iter=300, sample_size=5)
     best_H = H_ests[best_idx].cpu().numpy()
 
     return best_H
+
+# === SIM3_RANSAC_UMEYAMA ===
+import numpy as _np
+
+def _umeyama_sim3_np(X, Y, eps=1e-9):
+    """
+    Estimate Sim3: Y ~= s * R * X + t
+    X,Y: (N,3) numpy
+    Return T (4,4) with top-left = sR, top-right = t
+    """
+    X = _np.asarray(X, dtype=_np.float64)
+    Y = _np.asarray(Y, dtype=_np.float64)
+    n = X.shape[0]
+    mx = X.mean(axis=0)
+    my = Y.mean(axis=0)
+    Xc = X - mx
+    Yc = Y - my
+
+    cov = (Yc.T @ Xc) / max(n, 1)
+    U, S, Vt = _np.linalg.svd(cov)
+
+    R = U @ Vt
+    if _np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+
+    varx = (Xc * Xc).sum() / max(n, 1)
+    if varx < eps:
+        s = 1.0
+    else:
+        s = (S.sum() / (varx + eps))
+
+    t = my - (s * (R @ mx))
+
+    T = _np.eye(4, dtype=_np.float64)
+    T[:3, :3] = s * R
+    T[:3, 3] = t
+    return T
+
+def ransac_sim3(X1, X2, num_iter=512, inlier_th=0.15, min_inliers=30, seed=0):
+    """
+    Robust Sim3 with RANSAC.
+    X1, X2: torch tensors (N,3) or numpy arrays
+    Return: 4x4 torch (if input torch) else numpy
+    """
+    try:
+        import torch
+        is_torch = isinstance(X1, torch.Tensor)
+    except Exception:
+        torch = None
+        is_torch = False
+
+    if is_torch:
+        dev = X1.device
+        X1n = X1.detach().cpu().numpy()
+        X2n = X2.detach().cpu().numpy()
+    else:
+        dev = None
+        X1n = _np.asarray(X1)
+        X2n = _np.asarray(X2)
+
+    # finite filter
+    finite = _np.isfinite(X1n).all(axis=1) & _np.isfinite(X2n).all(axis=1)
+    X1n = X1n[finite]
+    X2n = X2n[finite]
+    N = X1n.shape[0]
+    if N < 8:
+        raise RuntimeError(f"ransac_sim3: not enough finite correspondences: {N}")
+
+    rng = _np.random.default_rng(seed)
+    best_inl = 0
+    best_T = _np.eye(4, dtype=_np.float64)
+
+    sample_k = 4
+    for _ in range(num_iter):
+        idx = rng.choice(N, size=sample_k, replace=False)
+        T = _umeyama_sim3_np(X1n[idx], X2n[idx])
+
+        X1h = (T[:3, :3] @ X1n.T).T + T[:3, 3]
+        err = _np.linalg.norm(X1h - X2n, axis=1)
+        inl = int((err < inlier_th).sum())
+
+        if inl > best_inl:
+            best_inl = inl
+            best_T = T
+            if best_inl > 0.8 * N:
+                break
+
+    if best_inl < min_inliers:
+        raise RuntimeError(f"ransac_sim3: inliers too few: {best_inl} < {min_inliers}")
+
+    if is_torch:
+        return torch.tensor(best_T, dtype=X1.dtype, device=dev)
+    return best_T

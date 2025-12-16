@@ -27,6 +27,45 @@ class Submap:
         self.poses = poses
 
     def add_all_points(self, points, colors, conf, conf_threshold_percentile, intrinsics):
+
+        # [SEMANTIC_HARD_DROP] sanitize NaN/Inf points
+
+        # ensure invalid points never enter fusion/vis
+
+        try:
+
+            import torch
+
+            if isinstance(world_points, torch.Tensor):
+
+                valid = torch.isfinite(world_points).all(dim=-1)
+
+                if isinstance(conf, torch.Tensor):
+
+                    conf = conf.clone()
+
+                    conf[~valid] = 0
+
+                world_points = torch.nan_to_num(world_points, nan=0.0, posinf=0.0, neginf=0.0)
+
+            else:
+
+                import numpy as _np
+
+                wp = _np.asarray(world_points)
+
+                valid = _np.isfinite(wp).all(axis=-1)
+
+                conf = _np.asarray(conf).copy()
+
+                conf[~valid] = 0
+
+                world_points = _np.nan_to_num(wp, nan=0.0, posinf=0.0, neginf=0.0)
+
+        except Exception:
+
+            pass
+
         self.pointclouds = points
         self.colors = colors
         self.conf = conf

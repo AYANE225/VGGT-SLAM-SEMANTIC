@@ -1,4 +1,27 @@
 import numpy as np
+
+def _parse_ids_sem(x):
+    x = str(x).strip() if x is not None else ''
+    if not x:
+        return []
+    x = x.replace(',', ' ')
+    out = []
+    for p in x.split():
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
+
+def _percentile_ignore_zeros(a, pct):
+    """Compute percentile ignoring a<=0 (used to ensure semantic-masked conf=0 never survives)."""
+    a = np.asarray(a).reshape(-1)
+    a = a[a > 0]
+    if a.size == 0:
+        return 1e9
+    return float(np.percentile(a, pct))
+
 import cv2
 import gtsam
 import matplotlib.pyplot as plt
@@ -16,7 +39,7 @@ from vggt_slam.loop_closure import ImageRetrieval
 from vggt_slam.frame_overlap import FrameTracker
 from vggt_slam.map import GraphMap
 from vggt_slam.submap import Submap
-from vggt_slam.h_solve import ransac_projective
+from vggt_slam.h_solve import ransac_projective, ransac_sim3
 from vggt_slam.gradio_viewer import TrimeshViewer
 
 def color_point_cloud_by_confidence(pcd, confidence, cmap='viridis'):
@@ -245,6 +268,37 @@ class Solver:
 
         detected_loops = pred_dict["detected_loops"]
 
+
+        # [LOOP_DEDUP] deduplicate loop edges to avoid adding the same (i,j) multiple times
+
+        seen_pairs = set()
+
+        uniq_loops = []
+
+        for lm in detected_loops:
+
+            qi = getattr(lm, "query_submap_id", None)
+
+            di = getattr(lm, "detected_submap_id", None)
+
+            if qi is None or di is None:
+
+                uniq_loops.append(lm)
+
+                continue
+
+            a, b = (di, qi) if di <= qi else (qi, di)
+
+            if (a, b) in seen_pairs:
+
+                continue
+
+            seen_pairs.add((a, b))
+
+            uniq_loops.append(lm)
+
+        detected_loops = uniq_loops
+
         if self.use_point_map:
             world_points_map = pred_dict["world_points"]  # (S, H, W, 3)
             conf = pred_dict["world_points_conf"]  # (S, H, W)
@@ -334,6 +388,203 @@ class Solver:
         # Create and add submap.
         self.current_working_submap.set_reference_homography(H_w_submap)
         self.current_working_submap.add_all_poses(cam_to_world)
+        
+        # [SEM_MAPPING] mapping-only semantic mask (optional): only affects map fusion (add_all_points)
+        if getattr(self, "semantic_mapping_dir", ""):
+            try:
+                from pathlib import Path
+                import cv2
+                import numpy as _np
+                import torch
+
+                sem_dir = Path(self.semantic_mapping_dir)
+                suf = getattr(self, "semantic_mapping_suffix", ".png")
+                keep_ids = set(_parse_ids_sem(getattr(self, "semantic_mapping_keep_ids", "")))
+                ignore_ids = set(_parse_ids_sem(getattr(self, "semantic_mapping_ignore_ids", "")))
+                missing_ok = bool(getattr(self, "semantic_mapping_missing_ok", False))
+
+                img_paths = pred_dict.get("_image_paths", None)
+                if img_paths:
+                    # conf: (S,H,W)
+                    H = int(conf.shape[-2])
+                    W = int(conf.shape[-1])
+
+                    keep_list = []
+                    for ip in img_paths:
+                        stem = Path(ip).stem
+                        mp = sem_dir / f"{stem}{suf}"
+                        if not mp.exists():
+                            if missing_ok:
+                                keep_list.append(_np.ones((H, W), dtype=bool))
+                                continue
+                            raise FileNotFoundError(f"[SEM_MAPPING] mask not found: {mp}")
+
+                        m = cv2.imread(str(mp), cv2.IMREAD_UNCHANGED)
+                        if m is None:
+                            if missing_ok:
+                                keep_list.append(_np.ones((H, W), dtype=bool))
+                                continue
+                            raise RuntimeError(f"[SEM_MAPPING] failed to read: {mp}")
+                        if m.ndim == 3:
+                            m = m[..., 0]
+                        if m.shape != (H, W):
+                            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+                        m = m.astype(_np.int64)
+
+                        if len(keep_ids) > 0:
+                            keep = _np.isin(m, list(keep_ids))
+                        else:
+                            keep = ~_np.isin(m, list(ignore_ids))
+
+                        keep_list.append(keep)
+
+                    keep_np = _np.stack(keep_list, axis=0)  # (S,H,W)
+
+                    if isinstance(conf, torch.Tensor):
+                        kt = torch.from_numpy(keep_np).to(device=conf.device)
+                        conf = conf * kt
+                        z = (kt <= 0)
+                        world_points = world_points.clone()
+                        world_points[z] = float("nan")
+                    else:
+                        conf = _np.asarray(conf).copy()
+                        conf *= keep_np
+                        z = ~keep_np
+                        world_points = _np.asarray(world_points).copy()
+                        world_points[z] = _np.nan
+            except Exception as e:
+                print("[SEM_MAPPING] WARNING:", e)
+
+# Semantic hard drop (mask conf<=0) before fusion
+        # Do this at the end so it won't affect pose/scale estimation above.
+        if "world_points_conf" in pred_dict:
+            conf0 = conf  # (S,H,W)
+            if hasattr(world_points, "clone"):
+                z = (conf0 <= 0)
+                if z.any():
+                    world_points = world_points.clone()
+                    world_points[z] = float('nan')
+            else:
+                import numpy as _np
+                z = (_np.asarray(conf0) <= 0)
+                if z.any():
+                    world_points = _np.asarray(world_points).copy()
+                    world_points[z] = _np.nan
+
+        # [CONF_SRC_FIX] ensure conf matches point source
+
+        # if points come from unprojected depth, use depth_conf; if using point_map, use world_points_conf
+
+        if getattr(self, 'use_point_map', False):
+
+            if 'world_points_conf' in pred_dict:
+
+                conf = pred_dict['world_points_conf']
+
+        else:
+
+            if 'depth_conf' in pred_dict:
+
+                conf = pred_dict['depth_conf']
+
+
+        # [GEOM_CLIP] drop far outliers to kill 'fan' artifacts
+
+
+        try:
+
+
+            import torch
+
+
+            pts = world_points.reshape(-1, 3)
+
+
+            cf  = conf.reshape(-1)
+
+
+            valid = (cf > 0) & torch.isfinite(pts).all(dim=1)
+
+
+            if valid.any():
+
+
+                idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+
+
+                # sample up to 200k points to estimate center/threshold (fast & stable)
+
+
+                if idx.numel() > 200000:
+
+
+                    perm = torch.randperm(idx.numel(), device=idx.device)[:200000]
+
+
+                    idx_s = idx[perm]
+
+
+                else:
+
+
+                    idx_s = idx
+
+
+                pts_s = pts[idx_s]
+
+
+                center = pts_s.median(dim=0).values
+
+
+                r_s = torch.norm(pts_s - center, dim=1)
+
+
+                k = max(1, int(0.995 * r_s.numel()))
+
+
+                thr = r_s.kthvalue(k).values  # 99.5% quantile approx
+
+
+                r_all = torch.norm(pts[idx] - center, dim=1)
+
+
+                keep = (r_all <= thr)
+
+
+                drop = idx[~keep]
+
+
+                if drop.numel() > 0:
+
+
+                    cf2 = cf.clone()
+
+
+                    cf2[drop] = 0
+
+
+                    conf = cf2.reshape_as(conf)
+
+
+                    wp_flat = pts.clone()
+
+
+                    wp_flat[drop] = float("nan")
+
+
+                    world_points = wp_flat.reshape_as(world_points)
+
+
+                    print(f"[geom_clip] dropped {int(drop.numel())}/{int(idx.numel())} points (q=0.995)")
+
+
+        except Exception as _e:
+
+
+            print("[geom_clip] WARNING:", _e)
+
+
+
         self.current_working_submap.add_all_points(world_points, colors, conf, self.init_conf_threshold, intrinsics_cam)
         self.current_working_submap.set_conf_masks(conf) # TODO should make this work for point cloud conf as well
 
@@ -352,8 +603,27 @@ class Solver:
             else:
                 points_world_detected = self.map.get_submap(loop.detected_submap_id).get_frame_pointcloud(loop.detected_submap_frame).reshape(-1, 3)
                 points_world_query = self.current_working_submap.get_frame_pointcloud(loop_index).reshape(-1, 3)
-                H_relative_lc = ransac_projective(points_world_query, points_world_detected)
+                # [SEM_SAFE] filter NaN/Inf before ransac to avoid SciPy svd crash (keep_ids=0 may create invalid points)
+                try:
+                    import torch
+                    valid = torch.isfinite(points_world_query).all(dim=1) & torch.isfinite(points_world_detected).all(dim=1)
+                    n_valid = int(valid.sum().item())
+                    if n_valid < 8:
+                        print(f"[loop] skip ransac_projective: finite_corr={n_valid} (<8)")
+                        continue
+                    points_world_query = points_world_query[valid]
+                    points_world_detected = points_world_detected[valid]
+                except Exception as _e:
+                    print("[loop] WARNING: finite filter failed:", _e)
 
+                try:
+                    if self.use_sim3:
+                        H_relative_lc = ransac_sim3(points_world_query, points_world_detected)
+                    else:
+                        H_relative_lc = ransac_projective(points_world_query, points_world_detected)
+                except Exception as _e:
+                    print("[loop] WARNING: ransac_projective failed, skip loop constraint:", _e)
+                    continue
 
             self.graph.add_between_factor(loop.detected_submap_id, loop.query_submap_id, H_relative_lc, self.graph.relative_noise)
             self.graph.increment_loop_closure() # Just for debugging and analysis, keep track of total number of loop closures

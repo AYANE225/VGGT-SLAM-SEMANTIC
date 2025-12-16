@@ -7,6 +7,7 @@ import torch
 from tqdm.auto import tqdm
 import cv2
 import matplotlib.pyplot as plt
+from vggt_slam.semantics.semantic_filter import apply_semantic_filter
 
 import vggt_slam.slam_utils as utils
 from vggt_slam.solver import Solver
@@ -33,6 +34,25 @@ parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial 
 parser.add_argument("--vis_stride", type=int, default=1, help="Stride interval in the 3D point cloud image for visualization. Try increasing (such as 4) to reduce lag in visualizing large maps.")
 parser.add_argument("--vis_point_size", type=float, default=0.003, help="Visualization point size")
 
+parser.add_argument("--semantic_dir", type=str, default="", help="Folder of per-frame semantic masks (same basename as image)")
+parser.add_argument("--semantic_suffix", type=str, default=".png", help="Mask filename suffix, e.g. .png")
+parser.add_argument("--semantic_ignore_ids", type=str, default="", help="Class ids to DROP, e.g. \"0,1,2\"")
+parser.add_argument("--semantic_keep_ids", type=str, default="", help="If set, ONLY keep these class ids (overrides ignore)")
+parser.add_argument("--semantic_missing_ok", action="store_true", help="If mask missing, skip that frame (recommended during debugging)")
+
+parser.add_argument("--semantic_debug_dir", type=str, default="", help="If set, dump resized semantic keep/label PNGs for debugging")
+parser.add_argument("--semantic_debug_stride", type=int, default=20, help="Dump one debug mask every N frames (per submap batch)")
+
+parser.add_argument("--dump_pred_keys", action="store_true", help="Print predictions keys/shapes for the first batch")
+parser.add_argument("--semantic_conf_key", type=str, default="", help="Force which predictions[key] to mask (e.g. conf/weight)")
+parser.add_argument("--semantic_mapping_dir", type=str, default="", help="Mapping-only masks dir (default=semantic_dir)")
+parser.add_argument("--semantic_mapping_keep_ids", type=str, default="", help="Mapping-only keep ids, e.g. \"0\"")
+parser.add_argument("--semantic_mapping_ignore_ids", type=str, default="", help="Mapping-only ignore ids")
+parser.add_argument("--semantic_mapping_missing_ok", action="store_true", help="Mapping-only missing mask ok")
+parser.add_argument("--semantic_mapping_suffix", type=str, default="", help="Mapping-only suffix (default=semantic_suffix)")
+
+parser.add_argument("--stop_after_submaps", type=int, default=0, help="Stop after processing N submaps (0=run all)")
+
 def main():
     """
     Main function that wraps the entire pipeline of VGGT-SLAM.
@@ -50,6 +70,14 @@ def main():
         vis_stride = args.vis_stride,
         vis_point_size = args.vis_point_size,
     )
+
+    
+    # --- mapping-only semantic config (does NOT affect pose/loop, only affects add_all_points) ---
+    solver.semantic_mapping_dir = args.semantic_mapping_dir if args.semantic_mapping_dir else args.semantic_dir
+    solver.semantic_mapping_keep_ids = args.semantic_mapping_keep_ids
+    solver.semantic_mapping_ignore_ids = args.semantic_mapping_ignore_ids
+    solver.semantic_mapping_missing_ok = args.semantic_mapping_missing_ok
+    solver.semantic_mapping_suffix = args.semantic_mapping_suffix if args.semantic_mapping_suffix else args.semantic_suffix
 
     print("Initializing and loading VGGT model...")
     # model = VGGT.from_pretrained("facebook/VGGT-1B")
@@ -87,6 +115,27 @@ def main():
             print(image_names_subset)
             predictions = solver.run_predictions(image_names_subset, model, args.max_loops)
 
+            if args.dump_pred_keys and not hasattr(args, 'DUMP_PRED_KEYS_ONCE'):
+                setattr(args, 'DUMP_PRED_KEYS_ONCE', True)
+                print("\n[DUMP] predictions keys:")
+                try:
+                    ks = list(predictions.keys())
+                    print(ks)
+                    for k in ks:
+                        v = predictions[k]
+                        try:
+                            shp = tuple(v.shape)
+                        except Exception:
+                            shp = None
+                        try:
+                            dt = str(v.dtype)
+                        except Exception:
+                            dt = str(type(v))
+                        print(f"  - {k}: shape={shp}, dtype={dt}")
+                except Exception as e:
+                    print("[DUMP] failed:", e)
+            predictions = apply_semantic_filter(predictions, image_names_subset, args)
+            predictions["_image_paths"] = list(image_names_subset)
             data.append(predictions["intrinsic"][:,0,0])
 
             solver.add_points(predictions)
@@ -103,6 +152,12 @@ def main():
             
             # Reset for next submap.
             image_names_subset = image_names_subset[-args.overlapping_window_size:]
+
+            # Stop early after submaps (debug)
+            if args.stop_after_submaps and solver.map.get_num_submaps() >= args.stop_after_submaps:
+                print(f"[STOP] reached submaps={solver.map.get_num_submaps()} (stop_after_submaps={args.stop_after_submaps})")
+                break
+
         
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())
@@ -135,7 +190,6 @@ def main():
         plt.ylabel("Focal lengths")
         plt.grid()
         plt.show()
-
 
 if __name__ == "__main__":
     main()
