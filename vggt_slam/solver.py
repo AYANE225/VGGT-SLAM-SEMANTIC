@@ -246,6 +246,7 @@ class Solver:
         self.set_submap_poses(submap)
 
     def add_points(self, pred_dict):
+        import numpy as np
         """
         Args:
             pred_dict (dict):
@@ -590,11 +591,12 @@ class Solver:
 
         # Add in loop closures if any were detected.
         for index, loop in enumerate(detected_loops):
+            print(f"[semantic-loop] {loop.detected_submap_id}->{loop.query_submap_id}")
             assert loop.query_submap_id == self.current_working_submap.get_id()
 
             loop_index = self.current_working_submap.get_last_non_loop_frame_index() + index + 1
 
-            if self.use_sim3:
+            if False and self.use_sim3:
                 pose_world_detected = self.map.get_submap(loop.detected_submap_id).get_pose_subframe(loop.detected_submap_frame)
                 pose_world_query = self.current_working_submap.get_pose_subframe(loop_index)
                 pose_world_detected = gtsam.Pose3(pose_world_detected)
@@ -605,14 +607,16 @@ class Solver:
                 points_world_query = self.current_working_submap.get_frame_pointcloud(loop_index).reshape(-1, 3)
                 # [SEM_SAFE] filter NaN/Inf before ransac to avoid SciPy svd crash (keep_ids=0 may create invalid points)
                 try:
-                    import torch
-                    valid = torch.isfinite(points_world_query).all(dim=1) & torch.isfinite(points_world_detected).all(dim=1)
-                    n_valid = int(valid.sum().item())
+                    import numpy as np
+                    pwq = np.asarray(points_world_query)
+                    pwd = np.asarray(points_world_detected)
+                    valid = np.isfinite(pwq).all(axis=1) & np.isfinite(pwd).all(axis=1)
+                    n_valid = int(valid.sum())
                     if n_valid < 8:
                         print(f"[loop] skip ransac_projective: finite_corr={n_valid} (<8)")
                         continue
-                    points_world_query = points_world_query[valid]
-                    points_world_detected = points_world_detected[valid]
+                    points_world_query = pwq[valid]
+                    points_world_detected = pwd[valid]
                 except Exception as _e:
                     print("[loop] WARNING: finite filter failed:", _e)
 
