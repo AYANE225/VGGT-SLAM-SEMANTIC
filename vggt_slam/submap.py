@@ -47,7 +47,7 @@ class Submap:
         self.frames = frames
 
     def set_all_retrieval_vectors(self, retrieval_vectors):
-    # 兼容 solver.py 里调用的旧/新接口命名
+        # 兼容 solver.py 里调用的旧/新接口命名
         self.add_all_retrieval_vectors(retrieval_vectors)
 
     def get_all_retrieval_vectors(self):
