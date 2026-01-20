@@ -88,6 +88,12 @@ and then run the below command:
 python3 main.py --image_folder office_loop --max_loops 1 --vis_map
 ```
 
+If you do not already have `office_loop.zip`, you can download and extract it with:
+
+```
+./scripts/download_office_loop.sh
+```
+
 <p align="center">
   <img src="assets/office-loop-figure" width="300">
 </p>
@@ -95,6 +101,11 @@ python3 main.py --image_folder office_loop --max_loops 1 --vis_map
 *Running in the default SL(4) mode on this folder will show significant drift 
 in the projective degrees of freedom before the loop closure, and the drift will be corrected after the loop closure. You may notice drift in other scenes as well if the system goes too long without a loop closure. We are actively working on an upgraded 
 VGGT-SLAM that will have significantly reduced drift and other major updates so stay tuned!*
+
+### 中文详细使用说明
+
+如需更完整的中文说明（含环境自检、走廊语义优化建议与消融实验流程），请参考：  
+[`docs/USAGE_ZH.md`](docs/USAGE_ZH.md)
 
 ### Collecting Custom Data
 
@@ -182,4 +193,3 @@ If our code is helpful, please cite our paper as follows:
   year={2025}
 }
 ```
-
