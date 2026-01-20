@@ -439,6 +439,20 @@ class Solver:
         u = float(np.clip(margin / m0, u_min, 1.0))
         return margin, u, top1, top2
 
+    def _compute_u(self, margin: float) -> float:
+        """Map margin -> u in [u_min, 1]."""
+        if not self.semantic_u_enable:
+            return 1.0
+        m0 = float(max(1e-6, self.semantic_u_m0))
+        u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
+        try:
+            m = float(margin)
+        except Exception:
+            return 1.0
+        if not np.isfinite(m):
+            return 1.0
+        return float(np.clip(m / m0, u_min, 1.0))
+
     # -------------------------
     # visualization helpers
     # -------------------------
@@ -863,7 +877,7 @@ class Solver:
                     margin = float(best_sim - second_sim) if len(cand) > 1 else 1.0
 
                     # Map margin -> u in (u_min, 1]; small margin => ambiguous => down-weight.
-                    u = float(self._compute_u(margin, scale=self.semantic_u_scale, u_min=self.semantic_u_min))
+                    u = float(self._compute_u(margin))
 
                     topk = max(1, int(self.semantic_loop_topk))
                     keep = [i for (i, _) in cand[:topk]]
@@ -910,4 +924,3 @@ class Solver:
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
 
         return predictions
-
