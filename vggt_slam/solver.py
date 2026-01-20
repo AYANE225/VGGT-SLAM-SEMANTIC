@@ -269,7 +269,32 @@ class Solver:
         self.vis_stride = vis_stride
         self.vis_point_size = vis_point_size
 
-        print("Starting viser server...")
+        # --- 参数安全检查（中文注释：防止配置不合法导致运行中崩溃） ---
+        self._sanitize_semantic_params()
+
+    def _sanitize_semantic_params(self) -> None:
+        """
+        确保语义相关参数处于合理范围，避免异常配置导致数值不稳定或崩溃。
+        该逻辑不会改变主流程，仅做安全兜底与警告。
+        """
+        # semantic weights
+        if self.semantic_w_min > self.semantic_w_max:
+            print(
+                f"[WARN] semantic_w_min({self.semantic_w_min}) > semantic_w_max({self.semantic_w_max}), swap them."
+            )
+            self.semantic_w_min, self.semantic_w_max = self.semantic_w_max, self.semantic_w_min
+
+        self.semantic_w_min = max(0.0, float(self.semantic_w_min))
+        self.semantic_w_max = max(self.semantic_w_min, float(self.semantic_w_max))
+        self.semantic_w_gamma = max(0.0, float(self.semantic_w_gamma))
+        self.semantic_w_s0 = max(0.0, float(self.semantic_w_s0))
+
+        # uniqueness params
+        self.semantic_u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
+        self.semantic_u_m0 = max(0.0, float(self.semantic_u_m0))
+        if self.semantic_loop_topk < 1:
+            print("[WARN] semantic_loop_topk < 1, fallback to 1.")
+            self.semantic_loop_topk = 1
 
     # -------------------------
     # stats logging
@@ -379,7 +404,7 @@ class Solver:
     # -------------------------
     # corridor anti-aliasing helpers (uniqueness)
     # -------------------------
-    def _get_keyframe_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
+    def _get_frame_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
         """取 retrieval embedding（归一化后）"""
         try:
             vecs = getattr(submap, "retrieval_vectors", None)
@@ -394,6 +419,9 @@ class Solver:
             return v / n
         except Exception:
             return None
+
+    def _get_keyframe_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
+        return self._get_frame_retrieval_vec(submap, frame_idx)
 
     def _compute_uniqueness_from_map(
         self,
@@ -434,10 +462,22 @@ class Solver:
         top2 = float(s_sorted[1])
         margin = float(top1 - top2)
 
+        u = float(self._compute_u(margin))
+        return margin, u, top1, top2
+
+    def _compute_u(self, margin: float) -> float:
+        """Map margin -> u in [u_min, 1]."""
+        if not self.semantic_u_enable:
+            return 1.0
         m0 = float(max(1e-6, self.semantic_u_m0))
         u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
-        u = float(np.clip(margin / m0, u_min, 1.0))
-        return margin, u, top1, top2
+        try:
+            m = float(margin)
+        except Exception:
+            return 1.0
+        if not np.isfinite(m):
+            return 1.0
+        return float(np.clip(m / m0, u_min, 1.0))
 
     def _compute_u(self, margin: float) -> float:
         """Map margin -> u in [u_min, 1]."""
@@ -870,11 +910,38 @@ class Solver:
                     after = 0
                     print(f"[semantic_loop_gate] min_sim={thr:.3f} {before}->{after} (no candidate) sims={[round(x,3) for x in sims]}")
                 else:
-                    # 2) rank + compute ambiguity margin (best-second best)
+                    # 2) rank by semantic sim; compute uniqueness margin using retrieval embeddings
                     cand.sort(key=lambda x: x[1], reverse=True)
                     best_i, best_sim = cand[0]
                     second_sim = cand[1][1] if len(cand) > 1 else -1.0
-                    margin = float(best_sim - second_sim) if len(cand) > 1 else 1.0
+
+                    q_vec = self._get_frame_retrieval_vec(new_submap, q_idx)
+                    retrieval_sims: List[Tuple[int, float]] = []
+                    if q_vec is not None:
+                        for i, _ in cand:
+                            loop = detected_loops[i]
+                            d_sid = getattr(loop, "detected_submap_id", None)
+                            d_fid = getattr(loop, "detected_submap_frame", None)
+                            if (d_sid is None) or (d_fid is None):
+                                continue
+                            d_submap = self.map.get_submap(d_sid)
+                            d_vec = self._get_frame_retrieval_vec(d_submap, int(d_fid))
+                            if d_vec is None:
+                                continue
+                            retrieval_sims.append((i, float(np.dot(q_vec, d_vec))))
+
+                    margin_valid = False
+                    if len(retrieval_sims) >= 2:
+                        retrieval_sims.sort(key=lambda x: x[1], reverse=True)
+                        top1 = retrieval_sims[0][1]
+                        top2 = retrieval_sims[1][1]
+                        margin = float(top1 - top2)
+                        margin_valid = True
+                    elif len(retrieval_sims) == 1:
+                        margin = 1.0
+                        margin_valid = True
+                    else:
+                        margin = 0.0
 
                     # Map margin -> u in (u_min, 1]; small margin => ambiguous => down-weight.
                     u = float(self._compute_u(margin))
@@ -895,7 +962,8 @@ class Solver:
                     after = len(detected_loops)
                     print(
                         f"[semantic_loop_gate] min_sim={thr:.3f} topk={topk} {before}->{after} "
-                        f"best={best_sim:.3f} second={second_sim:.3f} margin={margin:.3f} u={u:.3f} "
+                        f"best={best_sim:.3f} second={second_sim:.3f} margin={margin:.3f} "
+                        f"u={u:.3f} margin_thr={float(self.semantic_loop_margin_thr):.3f} "
                         f"keep={keep} sims_head={[round(x,3) for x in sims[:10]]}"
                     )
             except Exception as e:

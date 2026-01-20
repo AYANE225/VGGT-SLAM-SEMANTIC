@@ -86,7 +86,7 @@ class GraphMap:
 
     
     def get_submaps(self):
-        return self.submaps.values()
+        return list(self.submaps.values())
 
     def ordered_submaps_by_key(self):
         for k in sorted(self.submaps):
