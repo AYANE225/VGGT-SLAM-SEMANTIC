@@ -1,0 +1,25 @@
+# data / outputs
+DATA/
+RUNS/
+LOG/
+backups/
+*.zip
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env/
+
+# model / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# misc
+poses.txt
