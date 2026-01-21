@@ -38,36 +38,9 @@ conda activate vggt-slam
 
 ---
 
-## 2. 快速自检
+## 2. 数据准备
 
-新增了一个**环境自检脚本**，建议在正式跑实验前先执行：
-
-```bash
-python tools/check_env.py \
-  --data_dir /path/to/your/images \
-  --semantic_backend_cfg /path/to/semantic_backend.yaml
-```
-
-该脚本会检查：
-- `torch / cv2 / open3d / gtsam / numpy` 是否能导入
-- CUDA 是否可用（GPU 名称）
-- 数据集路径与图片数量
-- 语义配置文件是否存在
-
----
-
-## 3. 数据准备
-
-### 3.1 示例数据（快速验证）
-如果你还没有数据，可以使用官方的 `office_loop.zip`：
-
-```bash
-./scripts/download_office_loop.sh
-```
-
-解压后会得到 `office_loop/` 目录。
-
-### 3.2 走廊数据（相似纹理 / 长直走廊）
+### 2.1 走廊数据（相似纹理 / 长直走廊）
 建议将走廊数据整理成如下结构建议（示例）：
 ```
 DATA/
@@ -116,6 +89,10 @@ python main.py \
 - `semantic_dynamic_min_sim`：是否启用动态语义阈值（EMA）
 - `semantic_dynamic_min_sim_alpha`：EMA 平滑系数（越大越平滑）
 - `semantic_dynamic_min_sim_margin`：动态阈值偏移（EMA - margin）
+- `loop_geom_inlier_thr`：loop 几何一致性阈值（误差阈）
+- `loop_geom_min_inliers`：loop 最小 inlier 数（不足直接拒绝）
+- `loop_geom_ref_inliers`：用于几何权重归一化的参考 inlier 数
+- `loop_geom_max_mean_err`：loop 平均几何误差上限（过大直接拒绝）
 
 ---
 
@@ -129,6 +106,10 @@ python main.py \
 - `semantic_u_min`: 0.2 ~ 0.3
 
 这会使得**语义相似但不唯一的回环候选自动降权**，避免错误闭环主导优化。
+
+补充策略：
+- 语义仅作为**软证据**（soft gate），不会直接删掉 loop。
+- loop 必须通过几何一致性门槛（inlier/误差），几何不过关的回环会被拒绝。
 
 ---
 
