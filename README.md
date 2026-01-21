@@ -96,6 +96,11 @@ python3 main.py --image_folder office_loop --max_loops 1 --vis_map
 in the projective degrees of freedom before the loop closure, and the drift will be corrected after the loop closure. You may notice drift in other scenes as well if the system goes too long without a loop closure. We are actively working on an upgraded 
 VGGT-SLAM that will have significantly reduced drift and other major updates so stay tuned!*
 
+### 中文详细使用说明
+
+如需更完整的中文说明（含环境自检、走廊语义优化建议与消融实验流程），请参考：  
+[`docs/USAGE_ZH.md`](docs/USAGE_ZH.md)
+
 ### Collecting Custom Data
 
 To quickly collect a test on a custom dataset, you can record a trajectory with a cell phone and convert the MOV file to a folder of images with:
@@ -182,4 +187,3 @@ If our code is helpful, please cite our paper as follows:
   year={2025}
 }
 ```
-
