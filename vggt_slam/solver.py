@@ -495,6 +495,20 @@ class Solver:
             return 1.0
         return float(np.clip(m / m0, u_min, 1.0))
 
+    def _compute_u(self, margin: float) -> float:
+        """Map margin -> u in [u_min, 1]."""
+        if not self.semantic_u_enable:
+            return 1.0
+        m0 = float(max(1e-6, self.semantic_u_m0))
+        u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
+        try:
+            m = float(margin)
+        except Exception:
+            return 1.0
+        if not np.isfinite(m):
+            return 1.0
+        return float(np.clip(m / m0, u_min, 1.0))
+
     # -------------------------
     # visualization helpers
     # -------------------------
@@ -990,9 +1004,7 @@ class Solver:
                     print(
                         f"[semantic_loop_gate] min_sim={thr:.3f} topk={topk} {before}->{after} "
                         f"best={best_sim:.3f} second={second_sim:.3f} margin={margin:.3f} "
-                        f"sim_margin={sim_margin:.3f} u={u:.3f} "
-                        f"margin_thr={float(self.semantic_loop_margin_thr):.3f} "
-                        f"sim_margin_thr={float(self.semantic_loop_sim_margin_thr):.3f} "
+                        f"u={u:.3f} margin_thr={float(self.semantic_loop_margin_thr):.3f} "
                         f"keep={keep} sims_head={[round(x,3) for x in sims[:10]]}"
                     )
             except Exception as e:
