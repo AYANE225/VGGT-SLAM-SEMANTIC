@@ -88,6 +88,12 @@ and then run the below command:
 python3 main.py --image_folder office_loop --max_loops 1 --vis_map
 ```
 
+If you do not already have `office_loop.zip`, you can download and extract it with:
+
+```
+./scripts/download_office_loop.sh
+```
+
 <p align="center">
   <img src="assets/office-loop-figure" width="300">
 </p>

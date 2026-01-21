@@ -1,5 +1,9 @@
 # data / outputs
 DATA/
+!DATA/
+DATA/**
+!DATA/rgb.tar.gz.part_*
+!DATA/rgb.tar.gz.sha256
 RUNS/
 LOG/
 backups/
