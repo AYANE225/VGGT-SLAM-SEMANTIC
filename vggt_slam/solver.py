@@ -160,6 +160,10 @@ class Solver:
         # --- semantic gate（筛选 loop candidate / retrieved frames）---
         semantic_gate_mode: str = "both",   # off|filter|retrieved|both
         disable_semantic_gate: bool = False,
+        # --- dynamic semantic threshold (optional) ---
+        semantic_dynamic_min_sim: bool = False,
+        semantic_dynamic_min_sim_alpha: float = 0.9,
+        semantic_dynamic_min_sim_margin: float = 0.05,
         # --- semantic factor reweighting（核心：语义参与图优化）---
         semantic_weight_mode: str = "loop_only",  # off|loop_only|all_edges
         semantic_w_min: float = 0.25,
@@ -178,6 +182,8 @@ class Solver:
         # a margin (best-second best) and down-weight ambiguous loops.
         semantic_loop_topk: int = 1,
         semantic_loop_margin_thr: float = 0.02,
+        # 语义相似度边界（best-second）过小时进一步降权（走廊歧义场景）
+        semantic_loop_sim_margin_thr: float = 0.02,
         # --- stats logging ---
         edge_stats_path: str = "",
         **kwargs,
@@ -205,9 +211,16 @@ class Solver:
         if (not self.use_semantic_backend) or (self.semantic_backend is None) or self.disable_semantic_gate:
             self.semantic_gate_mode = "off"
 
+        # dynamic semantic threshold (optional)
+        self.semantic_dynamic_min_sim = bool(semantic_dynamic_min_sim)
+        self.semantic_dynamic_min_sim_alpha = float(semantic_dynamic_min_sim_alpha)
+        self.semantic_dynamic_min_sim_margin = float(semantic_dynamic_min_sim_margin)
+        self._semantic_sim_ema: Optional[float] = None
+
         # loop ambiguity control (only meaningful if semantic backend is enabled)
         self.semantic_loop_topk = int(semantic_loop_topk)
         self.semantic_loop_margin_thr = float(semantic_loop_margin_thr)
+        self.semantic_loop_sim_margin_thr = float(semantic_loop_sim_margin_thr)
 
         # semantic weights
         self.semantic_weight_mode = str(semantic_weight_mode)
@@ -269,7 +282,35 @@ class Solver:
         self.vis_stride = vis_stride
         self.vis_point_size = vis_point_size
 
-        print("Starting viser server...")
+        # --- 参数安全检查（中文注释：防止配置不合法导致运行中崩溃） ---
+        self._sanitize_semantic_params()
+
+    def _sanitize_semantic_params(self) -> None:
+        """
+        确保语义相关参数处于合理范围，避免异常配置导致数值不稳定或崩溃。
+        该逻辑不会改变主流程，仅做安全兜底与警告。
+        """
+        # semantic weights
+        if self.semantic_w_min > self.semantic_w_max:
+            print(
+                f"[WARN] semantic_w_min({self.semantic_w_min}) > semantic_w_max({self.semantic_w_max}), swap them."
+            )
+            self.semantic_w_min, self.semantic_w_max = self.semantic_w_max, self.semantic_w_min
+
+        self.semantic_w_min = max(0.0, float(self.semantic_w_min))
+        self.semantic_w_max = max(self.semantic_w_min, float(self.semantic_w_max))
+        self.semantic_w_gamma = max(0.0, float(self.semantic_w_gamma))
+        self.semantic_w_s0 = max(0.0, float(self.semantic_w_s0))
+
+        # uniqueness params
+        self.semantic_u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
+        self.semantic_u_m0 = max(0.0, float(self.semantic_u_m0))
+        self.semantic_loop_sim_margin_thr = max(0.0, float(self.semantic_loop_sim_margin_thr))
+        self.semantic_dynamic_min_sim_alpha = float(np.clip(self.semantic_dynamic_min_sim_alpha, 0.0, 1.0))
+        self.semantic_dynamic_min_sim_margin = max(0.0, float(self.semantic_dynamic_min_sim_margin))
+        if self.semantic_loop_topk < 1:
+            print("[WARN] semantic_loop_topk < 1, fallback to 1.")
+            self.semantic_loop_topk = 1
 
     # -------------------------
     # stats logging
@@ -870,6 +911,19 @@ class Solver:
                 sims = [float(self.semantic_backend.similarity(q_frame, rf)) for rf in retrieved_frames]
                 thr = float(self.semantic_min_sim)
 
+                # 动态语义阈值（可选）：根据当前相似度分布做 EMA 调整
+                if self.semantic_dynamic_min_sim and len(sims) > 0:
+                    mean_sim = float(np.mean(sims))
+                    if self._semantic_sim_ema is None:
+                        self._semantic_sim_ema = mean_sim
+                    else:
+                        alpha = float(self.semantic_dynamic_min_sim_alpha)
+                        self._semantic_sim_ema = alpha * self._semantic_sim_ema + (1.0 - alpha) * mean_sim
+                    thr = max(
+                        thr,
+                        float(self._semantic_sim_ema) - float(self.semantic_dynamic_min_sim_margin),
+                    )
+
                 # cache sim to loop object if possible
                 for i, sim in enumerate(sims):
                     try:
@@ -919,7 +973,18 @@ class Solver:
                         margin = 0.0
 
                     # Map margin -> u in (u_min, 1]; small margin => ambiguous => down-weight.
-                    u = float(self._compute_u(margin))
+                    if margin_valid:
+                        u = float(self._compute_u(margin))
+                        if margin < float(self.semantic_loop_margin_thr):
+                            u = float(min(u, self.semantic_u_min))
+                    else:
+                        u = 1.0
+
+                    # 语义相似度本身也可能出现“高相似但不唯一”的情况（走廊）
+                    # best-second 的差距过小则进一步降权。
+                    sim_margin = float(best_sim - second_sim)
+                    if sim_margin < float(self.semantic_loop_sim_margin_thr):
+                        u = float(min(u, self.semantic_u_min))
 
                     topk = max(1, int(self.semantic_loop_topk))
                     keep = [i for (i, _) in cand[:topk]]
@@ -929,6 +994,7 @@ class Solver:
                         try:
                             setattr(detected_loops[i], "semantic_margin", float(margin))
                             setattr(detected_loops[i], "semantic_u", float(u))
+                            setattr(detected_loops[i], "semantic_sim_margin", float(sim_margin))
                         except Exception:
                             pass
 
