@@ -6,13 +6,12 @@
 
 ## 目录
 1. [环境准备](#1-环境准备)
-2. [快速自检](#2-快速自检)
-3. [数据准备](#3-数据准备)
-4. [基础运行（非语义）](#4-基础运行非语义)
-5. [语义优化相关配置](#5-语义优化相关配置)
-6. [走廊数据的建议用法](#6-走廊数据的建议用法)
-7. [消融实验脚本](#7-消融实验脚本)
-8. [常见问题](#8-常见问题)
+2. [数据准备](#2-数据准备)
+3. [基础运行（非语义）](#3-基础运行非语义)
+4. [语义优化相关配置](#4-语义优化相关配置)
+5. [走廊数据的建议用法](#5-走廊数据的建议用法)
+6. [消融实验脚本](#6-消融实验脚本)
+7. [常见问题](#7-常见问题)
 
 ---
 
@@ -83,7 +82,7 @@ DATA/
 
 ---
 
-## 4. 基础运行（非语义）
+## 3. 基础运行（非语义）
 
 ### 4.1 最小示例
 ```bash
@@ -99,7 +98,7 @@ python main.py \
 
 ---
 
-## 5. 语义优化相关配置
+## 4. 语义优化相关配置
 
 语义优化包含两部分：
 1. **语义相似度 (semantic sim)** → 衡量可信度
@@ -113,10 +112,14 @@ python main.py \
 - `semantic_u_enable`：启用唯一性
 - `semantic_u_m0`、`semantic_u_min`：唯一性曲线控制
 - `semantic_loop_margin_thr`：走廊低 margin 降权阈值
+- `semantic_loop_sim_margin_thr`：语义相似度 best-second 过小则降权（走廊高相似歧义）
+- `semantic_dynamic_min_sim`：是否启用动态语义阈值（EMA）
+- `semantic_dynamic_min_sim_alpha`：EMA 平滑系数（越大越平滑）
+- `semantic_dynamic_min_sim_margin`：动态阈值偏移（EMA - margin）
 
 ---
 
-## 6. 走廊数据的建议用法
+## 5. 走廊数据的建议用法
 
 走廊场景常见问题是**高相似但低唯一**，因此建议配置：
 
@@ -129,15 +132,19 @@ python main.py \
 
 ---
 
-## 7. 消融实验脚本
+## 6. 消融实验脚本
 
-提供 `run_ablation_4groups.py` 用于四组消融：
+提供两套四组消融脚本（**无图像输出** / **带图像输出**）：
+- `run_ablation_4groups.py`（无图像输出）
+- `run_ablation_4groups_vis.py`（带图像输出，可用 `--save_images` 导出输入样例图）
+
+四组消融固定为：
 - baseline
 - gate_only
 - weight_only
 - gate_weight
 
-示例命令：
+无图像输出示例命令：
 ```bash
 PYTHONPATH=./vggt:./salad python run_ablation_4groups.py \
   --data DATA/corridor/rgb \
@@ -145,6 +152,17 @@ PYTHONPATH=./vggt:./salad python run_ablation_4groups.py \
   --submap_size 16 --max_loops 1 \
   --min_disparity 50 --conf_threshold 25 \
   --semantic_min_sim 0.25
+```
+
+带图像输出示例命令：
+```bash
+PYTHONPATH=./vggt:./salad python run_ablation_4groups_vis.py \
+  --data DATA/corridor/rgb \
+  --out_dir RUNS/ablation_corridor_vis \
+  --submap_size 16 --max_loops 1 \
+  --min_disparity 50 --conf_threshold 25 \
+  --semantic_min_sim 0.25 \
+  --save_images
 ```
 
 输出结构（示例）：
@@ -160,7 +178,7 @@ RUNS/ablation_corridor/
 
 ---
 
-## 8. 常见问题
+## 7. 常见问题
 
 ### 8.1 `ImportError: libGL.so.1`
 解决：
