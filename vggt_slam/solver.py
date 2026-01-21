@@ -142,6 +142,7 @@ class EdgeStat:
     # --- corridor anti-aliasing additions ---
     margin: float = 0.0   # top1-top2 similarity gap (retrieval space)
     u: float = 1.0        # uniqueness factor in [u_min, 1]
+    sim_margin: float = 0.0  # best-second semantic sim gap
 
 class Solver:
     def __init__(
@@ -160,6 +161,10 @@ class Solver:
         # --- semantic gate（筛选 loop candidate / retrieved frames）---
         semantic_gate_mode: str = "both",   # off|filter|retrieved|both
         disable_semantic_gate: bool = False,
+        # --- dynamic semantic threshold (optional) ---
+        semantic_dynamic_min_sim: bool = False,
+        semantic_dynamic_min_sim_alpha: float = 0.9,
+        semantic_dynamic_min_sim_margin: float = 0.05,
         # --- semantic factor reweighting（核心：语义参与图优化）---
         semantic_weight_mode: str = "loop_only",  # off|loop_only|all_edges
         semantic_w_min: float = 0.25,
@@ -178,6 +183,15 @@ class Solver:
         # a margin (best-second best) and down-weight ambiguous loops.
         semantic_loop_topk: int = 1,
         semantic_loop_margin_thr: float = 0.02,
+        # 语义相似度边界（best-second）过小时进一步降权（走廊歧义场景）
+        semantic_loop_sim_margin_thr: float = 0.02,
+        # --- loop geometry gate (loop-only, hard geometry checks) ---
+        loop_geom_inlier_thr: float = 0.02,
+        loop_geom_min_inliers: int = 300,
+        loop_geom_ref_inliers: int = 2000,
+        loop_geom_max_mean_err: float = 0.05,
+        # --- loop diagnostics ---
+        loop_diag_topk: int = 10,
         # --- stats logging ---
         edge_stats_path: str = "",
         **kwargs,
@@ -205,15 +219,35 @@ class Solver:
         if (not self.use_semantic_backend) or (self.semantic_backend is None) or self.disable_semantic_gate:
             self.semantic_gate_mode = "off"
 
+        # dynamic semantic threshold (optional)
+        self.semantic_dynamic_min_sim = bool(semantic_dynamic_min_sim)
+        self.semantic_dynamic_min_sim_alpha = float(semantic_dynamic_min_sim_alpha)
+        self.semantic_dynamic_min_sim_margin = float(semantic_dynamic_min_sim_margin)
+        self._semantic_sim_ema: Optional[float] = None
+
         # loop ambiguity control (only meaningful if semantic backend is enabled)
         self.semantic_loop_topk = int(semantic_loop_topk)
         self.semantic_loop_margin_thr = float(semantic_loop_margin_thr)
+        self.semantic_loop_sim_margin_thr = float(semantic_loop_sim_margin_thr)
+
+        # loop geometry gate (hard check)
+        self.loop_geom_inlier_thr = float(loop_geom_inlier_thr)
+        self.loop_geom_min_inliers = int(loop_geom_min_inliers)
+        self.loop_geom_ref_inliers = int(loop_geom_ref_inliers)
+        self.loop_geom_max_mean_err = float(loop_geom_max_mean_err)
+
+        # loop diagnostics
+        self.loop_diag_topk = int(loop_diag_topk)
+        self._loop_diag_cache: List[Dict[str, float]] = []
 
         # semantic weights
         self.semantic_weight_mode = str(semantic_weight_mode)
         if self.semantic_weight_mode not in ("off", "loop_only", "all_edges"):
             print(f"[WARN] unknown semantic_weight_mode={self.semantic_weight_mode}, fallback to off")
             self.semantic_weight_mode = "off"
+        if self.semantic_weight_mode == "all_edges":
+            print("[WARN] semantic_weight_mode=all_edges not allowed; fallback to loop_only")
+            self.semantic_weight_mode = "loop_only"
 
         self.semantic_w_min = float(semantic_w_min)
         self.semantic_w_max = float(semantic_w_max)
@@ -269,7 +303,40 @@ class Solver:
         self.vis_stride = vis_stride
         self.vis_point_size = vis_point_size
 
-        print("Starting viser server...")
+        # --- 参数安全检查（中文注释：防止配置不合法导致运行中崩溃） ---
+        self._sanitize_semantic_params()
+
+    def _sanitize_semantic_params(self) -> None:
+        """
+        确保语义相关参数处于合理范围，避免异常配置导致数值不稳定或崩溃。
+        该逻辑不会改变主流程，仅做安全兜底与警告。
+        """
+        # semantic weights
+        if self.semantic_w_min > self.semantic_w_max:
+            print(
+                f"[WARN] semantic_w_min({self.semantic_w_min}) > semantic_w_max({self.semantic_w_max}), swap them."
+            )
+            self.semantic_w_min, self.semantic_w_max = self.semantic_w_max, self.semantic_w_min
+
+        self.semantic_w_min = max(0.0, float(self.semantic_w_min))
+        self.semantic_w_max = max(self.semantic_w_min, float(self.semantic_w_max))
+        self.semantic_w_gamma = max(0.0, float(self.semantic_w_gamma))
+        self.semantic_w_s0 = max(0.0, float(self.semantic_w_s0))
+
+        # uniqueness params
+        self.semantic_u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
+        self.semantic_u_m0 = max(0.0, float(self.semantic_u_m0))
+        self.semantic_loop_sim_margin_thr = max(0.0, float(self.semantic_loop_sim_margin_thr))
+        self.semantic_dynamic_min_sim_alpha = float(np.clip(self.semantic_dynamic_min_sim_alpha, 0.0, 1.0))
+        self.semantic_dynamic_min_sim_margin = max(0.0, float(self.semantic_dynamic_min_sim_margin))
+        self.loop_geom_inlier_thr = max(0.0, float(self.loop_geom_inlier_thr))
+        self.loop_geom_min_inliers = max(0, int(self.loop_geom_min_inliers))
+        self.loop_geom_ref_inliers = max(1, int(self.loop_geom_ref_inliers))
+        self.loop_geom_max_mean_err = max(0.0, float(self.loop_geom_max_mean_err))
+        self.loop_diag_topk = max(1, int(self.loop_diag_topk))
+        if self.semantic_loop_topk < 1:
+            print("[WARN] semantic_loop_topk < 1, fallback to 1.")
+            self.semantic_loop_topk = 1
 
     # -------------------------
     # stats logging
@@ -301,7 +368,7 @@ class Solver:
             fieldnames=[
                 "time", "edge_type", "src", "dst", "sim", "w",
                 "n_good", "mask_thr", "mask_fallback_or", "weight_mode",
-                "margin", "u",
+                "margin", "u", "sim_margin",
             ],
         )
         if is_new:
@@ -324,6 +391,7 @@ class Solver:
             "weight_mode": str(stat.weight_mode),
             "margin": f"{float(stat.margin):.6f}",
             "u": f"{float(stat.u):.6f}",
+            "sim_margin": f"{float(stat.sim_margin):.6f}",
         })
         self._edge_stats_fp.flush()
 
@@ -376,10 +444,46 @@ class Solver:
         d = 1.0 - min(1.0, ng / ref)
         return float(w) * (1.0 + beta * d)
 
+    def _compute_loop_geom_stats(
+        self,
+        points_query: np.ndarray,
+        points_detected: np.ndarray,
+        H: np.ndarray,
+    ) -> Tuple[int, float, float]:
+        """
+        基于 projective H 的简单几何一致性检查：
+        返回 (inlier_count, mean_err, inlier_ratio)。
+        """
+        if points_query.size == 0 or points_detected.size == 0:
+            return 0, float("inf"), 0.0
+        try:
+            X1 = np.asarray(points_query, dtype=np.float64)
+            X2 = np.asarray(points_detected, dtype=np.float64)
+            X1_h = np.concatenate([X1, np.ones((X1.shape[0], 1))], axis=1)
+            X2_pred_h = (H @ X1_h.T).T
+            denom = np.clip(X2_pred_h[:, 3:4], 1e-9, None)
+            X2_pred = X2_pred_h[:, :3] / denom
+            errs = np.linalg.norm(X2_pred - X2, axis=1)
+            inlier_mask = errs < float(self.loop_geom_inlier_thr)
+            inlier_count = int(np.sum(inlier_mask))
+            mean_err = float(np.mean(errs)) if errs.size > 0 else float("inf")
+            inlier_ratio = float(inlier_count / max(1, errs.size))
+            return inlier_count, mean_err, inlier_ratio
+        except Exception:
+            return 0, float("inf"), 0.0
+
+    def _update_loop_diagnostics(self, record: Dict[str, float]) -> None:
+        """
+        只针对 loop 边记录诊断信息，按 mean_err 降序保留 Top-K。
+        """
+        self._loop_diag_cache.append(record)
+        self._loop_diag_cache.sort(key=lambda x: x.get("mean_err", 0.0), reverse=True)
+        self._loop_diag_cache = self._loop_diag_cache[: self.loop_diag_topk]
+
     # -------------------------
     # corridor anti-aliasing helpers (uniqueness)
     # -------------------------
-    def _get_keyframe_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
+    def _get_frame_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
         """取 retrieval embedding（归一化后）"""
         try:
             vecs = getattr(submap, "retrieval_vectors", None)
@@ -394,6 +498,9 @@ class Solver:
             return v / n
         except Exception:
             return None
+
+    def _get_keyframe_retrieval_vec(self, submap: Submap, frame_idx: int) -> Optional[np.ndarray]:
+        return self._get_frame_retrieval_vec(submap, frame_idx)
 
     def _compute_uniqueness_from_map(
         self,
@@ -434,10 +541,22 @@ class Solver:
         top2 = float(s_sorted[1])
         margin = float(top1 - top2)
 
+        u = float(self._compute_u(margin))
+        return margin, u, top1, top2
+
+    def _compute_u(self, margin: float) -> float:
+        """Map margin -> u in [u_min, 1]."""
+        if not self.semantic_u_enable:
+            return 1.0
         m0 = float(max(1e-6, self.semantic_u_m0))
         u_min = float(np.clip(self.semantic_u_min, 0.0, 1.0))
-        u = float(np.clip(margin / m0, u_min, 1.0))
-        return margin, u, top1, top2
+        try:
+            m = float(margin)
+        except Exception:
+            return 1.0
+        if not np.isfinite(m):
+            return 1.0
+        return float(np.clip(m / m0, u_min, 1.0))
 
     # -------------------------
     # visualization helpers
@@ -587,12 +706,8 @@ class Solver:
             self.graph.add_homography(new_pcd_num, np.eye(4))
 
             # Add between factor (prev -> new)
-            use_sem_w_odom = (
-                self.semantic_weight_mode == "all_edges"
-                and self.use_semantic_backend
-                and (self.semantic_backend is not None)
-                and hasattr(self.graph, "add_between_factor_weighted")
-            )
+            # 语义只作用在 loop-only，odom 不使用语义权重
+            use_sem_w_odom = False
 
             if use_sem_w_odom:
                 sim = 0.0
@@ -637,6 +752,7 @@ class Solver:
                     weight_mode=str(self.semantic_weight_mode),
                     margin=float(margin),
                     u=float(u),
+                    sim_margin=0.0,
                 ))
             else:
                 self.graph.add_between_factor(prior_pcd_num, new_pcd_num, H_relative, self.graph.relative_noise)
@@ -671,6 +787,9 @@ class Solver:
                 if abs(det_sid - query_sid) < min_loop_submap_gap:
                     continue
 
+                points_world_detected = self.map.get_submap(loop.detected_submap_id).get_frame_pointcloud(loop.detected_submap_frame).reshape(-1, 3)
+                points_world_query = self.current_working_submap.get_frame_pointcloud(loop_index).reshape(-1, 3)
+
                 if self.use_sim3:
                     pose_world_detected = self.map.get_submap(loop.detected_submap_id).get_pose_subframe(loop.detected_submap_frame)
                     pose_world_query = self.current_working_submap.get_pose_subframe(loop_index)
@@ -678,9 +797,25 @@ class Solver:
                     pose_world_query = gtsam.Pose3(pose_world_query)
                     H_relative_lc = pose_world_detected.between(pose_world_query).matrix()
                 else:
-                    points_world_detected = self.map.get_submap(loop.detected_submap_id).get_frame_pointcloud(loop.detected_submap_frame).reshape(-1, 3)
-                    points_world_query = self.current_working_submap.get_frame_pointcloud(loop_index).reshape(-1, 3)
                     H_relative_lc = ransac_projective(points_world_query, points_world_detected)
+
+                # 几何一致性门槛：几何不过关则拒绝 loop
+                inlier_count, mean_err, inlier_ratio = self._compute_loop_geom_stats(
+                    points_world_query,
+                    points_world_detected,
+                    H_relative_lc,
+                )
+                if (
+                    inlier_count < int(self.loop_geom_min_inliers)
+                    or mean_err > float(self.loop_geom_max_mean_err)
+                ):
+                    print(
+                        f"[loop_geom_reject] inliers={inlier_count} mean_err={mean_err:.4f} "
+                        f"{loop.detected_submap_id}->{loop.query_submap_id}"
+                    )
+                    continue
+
+                geom_weight = min(1.0, float(inlier_count) / float(self.loop_geom_ref_inliers))
 
                 # 关键：避免重复加边（weighted 就不要再 add normal）
                 use_sem_w_loop = (
@@ -710,15 +845,28 @@ class Solver:
                         loop_margin = float(getattr(loop, "semantic_margin", 0.0))
                         loop_u = float(getattr(loop, "semantic_u", 1.0))
 
-                        w = float(self._semantic_sim_to_weight(sim)) * float(loop_u)
+                        w = float(self._semantic_sim_to_weight(sim)) * float(loop_u) * float(geom_weight)
+                        w = min(float(w), float(self.semantic_w_max))
                         self.graph.add_between_factor_weighted(loop.detected_submap_id, loop.query_submap_id, H_relative_lc, w)
                         print(
-                            f"[sem_weight][loop] sim={sim:.3f} margin={loop_margin:.3f} u={loop_u:.2f} w={w:.2f} "
+                            f"[sem_weight][loop] sim={sim:.3f} margin={loop_margin:.3f} u={loop_u:.2f} "
+                            f"geom_w={geom_weight:.2f} w={w:.2f} "
                             f"{loop.detected_submap_id}->{loop.query_submap_id}"
                         )
                     except Exception as e:
                         print(f"[WARN] loop semantic weight failed -> fallback: {e}")
                         self.graph.add_between_factor(loop.detected_submap_id, loop.query_submap_id, H_relative_lc, self.graph.relative_noise)
+
+                    self._update_loop_diagnostics({
+                        "mean_err": float(mean_err),
+                        "inliers": float(inlier_count),
+                        "sim": float(sim),
+                        "u": float(loop_u),
+                        "margin": float(loop_margin),
+                        "sim_margin": float(getattr(loop, "semantic_sim_margin", 0.0)),
+                        "src": float(loop.detected_submap_id),
+                        "dst": float(loop.query_submap_id),
+                    })
 
                     self._edge_stats_log(EdgeStat(
                         time=datetime.now().isoformat(timespec="seconds"),
@@ -727,18 +875,22 @@ class Solver:
                         dst=int(loop.query_submap_id),
                         sim=float(sim),
                         w=float(w),
-                        n_good=0,
-                        mask_thr=0.0,
+                        n_good=int(inlier_count),
+                        mask_thr=float(mean_err),
                         mask_fallback_or=0,
                         weight_mode=str(self.semantic_weight_mode),
                         margin=float(getattr(loop, "semantic_margin", 0.0)),
                         u=float(getattr(loop, "semantic_u", 1.0)),
+                        sim_margin=float(getattr(loop, "semantic_sim_margin", 0.0)),
                     ))
                 else:
                     self.graph.add_between_factor(loop.detected_submap_id, loop.query_submap_id, H_relative_lc, self.graph.relative_noise)
 
                 self.graph.increment_loop_closure()
                 print("added loop closure factor", loop.detected_submap_id, loop.query_submap_id)
+
+            if len(self._loop_diag_cache) > 0:
+                print("[loop_diag_topk] mean_err desc:", self._loop_diag_cache[: self.loop_diag_topk])
 
                 print(
                     "homography between nodes estimated to be",
@@ -759,8 +911,7 @@ class Solver:
     # -------------------------
     def _filter_loops_by_semantic(self, new_submap, detected_loops):
         """
-        Filter detected_loops using semantic similarity between query frame and retrieved frame.
-        会把 sim 缓存到 loop.semantic_sim，后续 loop reweighting 直接用。
+        Soft gate: 不删除 loop，仅缓存 semantic_sim 给后续权重使用。
         """
         if self.semantic_gate_mode not in ("filter", "both"):
             return detected_loops
@@ -768,9 +919,6 @@ class Solver:
             return detected_loops
         if detected_loops is None or len(detected_loops) == 0:
             return detected_loops
-
-        kept = []
-        thr = float(self.semantic_min_sim)
 
         for loop in detected_loops:
             try:
@@ -783,7 +931,6 @@ class Solver:
                 d_sid = getattr(loop, "detected_submap_id", None)
                 d_fid = getattr(loop, "detected_submap_frame", None)
                 if (d_sid is None) or (d_fid is None):
-                    kept.append(loop)
                     continue
 
                 q_frame = new_submap.get_frame_at_index(int(q_idx))
@@ -791,13 +938,10 @@ class Solver:
 
                 sim = float(self.semantic_backend.similarity(q_frame, d_frame))
                 setattr(loop, "semantic_sim", sim)
-
-                if sim >= thr:
-                    kept.append(loop)
             except Exception:
-                kept.append(loop)
+                pass
 
-        return kept
+        return detected_loops
 
     def run_predictions(self, image_names, model, max_loops):
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -824,7 +968,7 @@ class Solver:
             before = len(detected_loops)
             detected_loops = self._filter_loops_by_semantic(new_submap, detected_loops)
             after = len(detected_loops)
-            print(colored("semantic_loop_filter", "cyan"), f"{before}->{after}")
+            print(colored("semantic_loop_filter_soft", "cyan"), f"{before}->{after} (soft)")
 
         if len(detected_loops) > 0:
             print(colored("detected_loops", "yellow"), detected_loops)
@@ -841,6 +985,19 @@ class Solver:
                 sims = [float(self.semantic_backend.similarity(q_frame, rf)) for rf in retrieved_frames]
                 thr = float(self.semantic_min_sim)
 
+                # 动态语义阈值（可选）：根据当前相似度分布做 EMA 调整
+                if self.semantic_dynamic_min_sim and len(sims) > 0:
+                    mean_sim = float(np.mean(sims))
+                    if self._semantic_sim_ema is None:
+                        self._semantic_sim_ema = mean_sim
+                    else:
+                        alpha = float(self.semantic_dynamic_min_sim_alpha)
+                        self._semantic_sim_ema = alpha * self._semantic_sim_ema + (1.0 - alpha) * mean_sim
+                    thr = max(
+                        thr,
+                        float(self._semantic_sim_ema) - float(self.semantic_dynamic_min_sim_margin),
+                    )
+
                 # cache sim to loop object if possible
                 for i, sim in enumerate(sims):
                     try:
@@ -848,42 +1005,83 @@ class Solver:
                     except Exception:
                         pass
 
-                # 1) threshold filter
-                cand = [(i, sims[i]) for i in range(len(sims)) if sims[i] >= thr]
+                # 1) soft gate: do not hard-drop by semantic threshold
+                cand = [(i, sims[i]) for i in range(len(sims))]
                 before = len(detected_loops)
-                if len(cand) == 0:
-                    detected_loops, retrieved_frames = [], []
-                    after = 0
-                    print(f"[semantic_loop_gate] min_sim={thr:.3f} {before}->{after} (no candidate) sims={[round(x,3) for x in sims]}")
+                # 2) rank by semantic sim; compute uniqueness margin using retrieval embeddings
+                cand.sort(key=lambda x: x[1], reverse=True)
+                best_i, best_sim = cand[0]
+                second_sim = cand[1][1] if len(cand) > 1 else -1.0
+
+                q_vec = self._get_frame_retrieval_vec(new_submap, q_idx)
+                retrieval_sims: List[Tuple[int, float]] = []
+                if q_vec is not None:
+                    for i, _ in cand:
+                        loop = detected_loops[i]
+                        d_sid = getattr(loop, "detected_submap_id", None)
+                        d_fid = getattr(loop, "detected_submap_frame", None)
+                        if (d_sid is None) or (d_fid is None):
+                            continue
+                        d_submap = self.map.get_submap(d_sid)
+                        d_vec = self._get_frame_retrieval_vec(d_submap, int(d_fid))
+                        if d_vec is None:
+                            continue
+                        retrieval_sims.append((i, float(np.dot(q_vec, d_vec))))
+
+                margin_valid = False
+                if len(retrieval_sims) >= 2:
+                    retrieval_sims.sort(key=lambda x: x[1], reverse=True)
+                    top1 = retrieval_sims[0][1]
+                    top2 = retrieval_sims[1][1]
+                    margin = float(top1 - top2)
+                    margin_valid = True
+                elif len(retrieval_sims) == 1:
+                    margin = 1.0
+                    margin_valid = True
                 else:
-                    # 2) rank + compute ambiguity margin (best-second best)
-                    cand.sort(key=lambda x: x[1], reverse=True)
-                    best_i, best_sim = cand[0]
-                    second_sim = cand[1][1] if len(cand) > 1 else -1.0
-                    margin = float(best_sim - second_sim) if len(cand) > 1 else 1.0
+                    margin = 0.0
 
-                    # Map margin -> u in (u_min, 1]; small margin => ambiguous => down-weight.
-                    u = float(self._compute_u(margin, scale=self.semantic_u_scale, u_min=self.semantic_u_min))
+                # Map margin -> u in (u_min, 1]; small margin => ambiguous => down-weight.
+                if margin_valid:
+                    u = float(self._compute_u(margin))
+                    if margin < float(self.semantic_loop_margin_thr):
+                        u = float(min(u, self.semantic_u_min))
+                else:
+                    u = 1.0
 
-                    topk = max(1, int(self.semantic_loop_topk))
-                    keep = [i for (i, _) in cand[:topk]]
+                # 语义相似度本身也可能出现“高相似但不唯一”的情况（走廊）
+                # best-second 的差距过小则进一步降权。
+                sim_margin = float(best_sim - second_sim)
+                if sim_margin < float(self.semantic_loop_sim_margin_thr):
+                    u = float(min(u, self.semantic_u_min))
 
-                    # Attach margin/u to kept loop objects for downstream weighting & logging.
-                    for i in keep:
-                        try:
-                            setattr(detected_loops[i], "semantic_margin", float(margin))
-                            setattr(detected_loops[i], "semantic_u", float(u))
-                        except Exception:
-                            pass
+                # soft gate: sim < thr 也不删边，只降低权重
+                sim_gate = min(1.0, float(best_sim / max(1e-6, thr)))
+                u = float(u) * float(sim_gate)
 
-                    detected_loops = [detected_loops[i] for i in keep]
-                    retrieved_frames = [retrieved_frames[i] for i in keep]
-                    after = len(detected_loops)
-                    print(
-                        f"[semantic_loop_gate] min_sim={thr:.3f} topk={topk} {before}->{after} "
-                        f"best={best_sim:.3f} second={second_sim:.3f} margin={margin:.3f} u={u:.3f} "
-                        f"keep={keep} sims_head={[round(x,3) for x in sims[:10]]}"
-                    )
+                topk = max(1, int(self.semantic_loop_topk))
+                keep = [i for (i, _) in cand[:topk]]
+
+                # Attach margin/u to kept loop objects for downstream weighting & logging.
+                for i in keep:
+                    try:
+                        setattr(detected_loops[i], "semantic_margin", float(margin))
+                        setattr(detected_loops[i], "semantic_u", float(u))
+                        setattr(detected_loops[i], "semantic_sim_margin", float(sim_margin))
+                    except Exception:
+                        pass
+
+                detected_loops = [detected_loops[i] for i in keep]
+                retrieved_frames = [retrieved_frames[i] for i in keep]
+                after = len(detected_loops)
+                print(
+                    f"[semantic_loop_gate] min_sim={thr:.3f} topk={topk} {before}->{after} "
+                    f"best={best_sim:.3f} second={second_sim:.3f} margin={margin:.3f} "
+                    f"sim_margin={sim_margin:.3f} sim_gate={sim_gate:.3f} u={u:.3f} "
+                    f"margin_thr={float(self.semantic_loop_margin_thr):.3f} "
+                    f"sim_margin_thr={float(self.semantic_loop_sim_margin_thr):.3f} "
+                    f"keep={keep} sims_head={[round(x,3) for x in sims[:10]]}"
+                )
             except Exception as e:
                 print(f"[WARN] semantic_loop_gate failed (keep loops): {e}")
 
@@ -910,4 +1108,3 @@ class Solver:
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
 
         return predictions
-

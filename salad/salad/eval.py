@@ -1,4 +1,5 @@
 import torch
+from contextlib import nullcontext
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 from tqdm import tqdm
@@ -59,16 +60,20 @@ def get_val_dataset(dataset_name, image_size=None):
 
 def get_descriptors(model, dataloader, device):
     descriptors = []
+    use_autocast = device == "cuda"
+    autocast_ctx = torch.autocast(device_type=device, dtype=torch.float16) if use_autocast else nullcontext()
+
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            for batch in tqdm(dataloader, 'Calculating descritptors...'):
+        with autocast_ctx:
+            for batch in tqdm(dataloader, "Calculating descritptors..."):
                 imgs, labels = batch
                 output = model(imgs.to(device)).cpu()
                 descriptors.append(output)
 
     return torch.cat(descriptors)
 
-def load_model(ckpt_path):
+def load_model(ckpt_path, device=None):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = VPRModel(
         backbone_arch='dinov2_vitb14',
         backbone_config={
@@ -85,10 +90,10 @@ def load_model(ckpt_path):
         },
     )
 
-    model.load_state_dict(torch.load(ckpt_path))
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model = model.eval()
-    model = model.to('cuda')
-    print(f"Loaded model from {ckpt_path} Successfully!")
+    model = model.to(device)
+    print(f"Loaded model from {ckpt_path} Successfully! (device={device})")
     return model
 
 def parse_args():
@@ -165,4 +170,3 @@ if __name__ == '__main__':
 
         del descriptors
         print('========> DONE!\n\n')
-
