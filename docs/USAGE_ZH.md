@@ -38,9 +38,36 @@ conda activate vggt-slam
 
 ---
 
-## 2. 数据准备
+## 2. 快速自检
 
-### 2.1 走廊数据（相似纹理 / 长直走廊）
+新增了一个**环境自检脚本**，建议在正式跑实验前先执行：
+
+```bash
+python tools/check_env.py \
+  --data_dir /path/to/your/images \
+  --semantic_backend_cfg /path/to/semantic_backend.yaml
+```
+
+该脚本会检查：
+- `torch / cv2 / open3d / gtsam / numpy` 是否能导入
+- CUDA 是否可用（GPU 名称）
+- 数据集路径与图片数量
+- 语义配置文件是否存在
+
+---
+
+## 3. 数据准备
+
+### 3.1 示例数据（快速验证）
+如果你还没有数据，可以使用官方的 `office_loop.zip`：
+
+```bash
+./scripts/download_office_loop.sh
+```
+
+解压后会得到 `office_loop/` 目录。
+
+### 3.2 走廊数据（相似纹理 / 长直走廊）
 建议将走廊数据整理成如下结构建议（示例）：
 ```
 DATA/
